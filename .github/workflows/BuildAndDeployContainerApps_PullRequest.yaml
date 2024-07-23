@@ -1,0 +1,182 @@
+name: Build and Deploy codebot to Container Apps
+
+on:
+  pull_request:
+
+env:
+  AZURE_CONTAINER_REGISTRY: acrpd1m
+  WEB_CONTAINER_NAME: "web"
+  BACKEND_CONTAINER_NAME: "backend"
+  SYNC_CONTAINER_NAME: "sync"
+  RESOURCE_GROUP: "rg-codebot-prod"
+  LOCATION: canadaeast
+  HEAD_REF: "$(echo ${{ github.head_ref }} | tr / -)"
+  PULL_REQUEST_RESOURCE_GROUP: "rg-codebot-pr-$(echo ${{ github.head_ref }} | tr / -)"
+  PULL_REQUEST_CONTAINER_APPS_ENV_NAME: "rg-codebot-pr-$(echo ${{ github.head_ref }} | tr / -)-env"
+
+jobs:
+  update_services:
+    name: Update Unio Services
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    outputs:
+      backendUrl: ${{ steps.deploy_backend.outputs.backendUrl }}
+      databaseUrl: ${{ steps.deploy_database.outputs.databaseUrl }}
+      syncUrl: ${{ steps.deploy_synchronizer.outputs.syncUrl }}
+    steps:
+      # Checks out the repository this file is in
+      - uses: actions/checkout@v3
+
+      # Logs in with your Azure credentials
+      - name: Azure login
+        uses: azure/login@v1.4.6
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create Resource Group
+        run: |
+          az group create \
+            --name ${{ env.PULL_REQUEST_RESOURCE_GROUP }} \
+            --location ${{ env.LOCATION }}
+
+      - name: Build and push Backend Server image to ACR
+        id: build_backend
+        run: |
+          az acr build \
+            --image ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/${{ env.BACKEND_CONTAINER_NAME }}:${{ github.sha }} \
+            --registry ${{ env.AZURE_CONTAINER_REGISTRY }} \
+            -g ${{ env.RESOURCE_GROUP }} ./backend
+
+      - name: Deploy Backend to Azure Container Apps
+        id: deploy_backend
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
+          az containerapp env create \
+            --name ${{ env.PULL_REQUEST_CONTAINER_APPS_ENV_NAME }} \
+            --resource-group ${{ env.PULL_REQUEST_RESOURCE_GROUP }} \
+            --location ${{ env.LOCATION }}
+          backendfqdn=$(az containerapp create \
+            --name ${{ env.BACKEND_CONTAINER_NAME }} \
+            --resource-group ${{ env.PULL_REQUEST_RESOURCE_GROUP }} \
+            --environment ${{ env.PULL_REQUEST_CONTAINER_APPS_ENV_NAME }} \
+            --env-vars AUTH0_DOMAIN=dev-d18xw1j3nee3urp2.us.auth0.com CLIENT_ID="${{ secrets.AUTH0_BACKEND_CLIENT_ID }}" CLIENT_SECRET="${{ secrets.AUTH0_CLIENT_SECRET }}" AUDIENCE=https://dev-d18xw1j3nee3urp2.us.auth0.com/api/v2/ \
+            --image ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/${{ env.BACKEND_CONTAINER_NAME }}:${{ github.sha }} \
+            --ingress external \
+            --target-port 3102 \
+            --registry-server ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io \
+            --registry-username ${{ secrets.AZURE_CLIENT_ID }} \
+            --registry-password ${{ secrets.AZURE_CLIENT_SECRET }} \
+            --min-replicas 1 \
+            --query properties.configuration.ingress.fqdn \
+            | jq -r '.')
+          echo "backendUrl=https://${backendfqdn}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Synchronizer image to ACR
+        id: build_sync
+        run: |
+          az acr build \
+            --image ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/${{ env.SYNC_CONTAINER_NAME }}:${{ github.sha }} \
+            --registry ${{ env.AZURE_CONTAINER_REGISTRY }} \
+            -g ${{ env.RESOURCE_GROUP }} ./synchronizer
+
+      - name: Decode POSTGRES SSL Certificate
+        id: decode_prostgres_ssl
+        run: |
+          decoded_key=$(echo "${{ secrets.POSTGRES_SSL_BASE64_CERTIFICATE }}" | base64 --decode)
+          echo "$decoded_key" > private_key.pem
+          echo "::set-output name=decoded_prostgres_ssl::$(cat private_key.pem)"
+
+      - name: Deploy Synchronizer to Azure Container Apps
+        id: deploy_synchronizer
+        env:
+          DECODED_PRIVATE_KEY: ${{ steps.decode_prostgres_ssl.outputs.decoded_prostgres_ssl }}
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
+          az containerapp env create \
+            --name ${{ env.PULL_REQUEST_CONTAINER_APPS_ENV_NAME }} \
+            --resource-group ${{ env.PULL_REQUEST_RESOURCE_GROUP }} \
+            --location ${{ env.LOCATION }}
+          synchronizerfqdn=$(az containerapp create \
+            --name ${{ env.SYNC_CONTAINER_NAME }} \
+            --resource-group ${{ env.PULL_REQUEST_RESOURCE_GROUP }} \
+            --environment ${{ env.PULL_REQUEST_CONTAINER_APPS_ENV_NAME }} \
+            --env-vars ENVIRONMENT=production HOST=unio-database.postgres.database.azure.com DB_USER=postgres PASSWORD="${{ secrets.DB_PASSWORD }}" DATABASE=postgres POSTGRES_SSL_BASE64_CERTIFICATE="${{ env.DECODED_PRIVATE_KEY }}" \
+            --image ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/${{ env.SYNC_CONTAINER_NAME }}:${{ github.sha }} \
+            --ingress external \
+            --target-port 3101 \
+            --registry-server ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io \
+            --registry-username ${{ secrets.AZURE_CLIENT_ID }} \
+            --registry-password ${{ secrets.AZURE_CLIENT_SECRET }} \
+            --min-replicas 1 \
+            --query properties.configuration.ingress.fqdn \
+            | jq -r '.')
+          echo "syncUrl=https://${synchronizerfqdn}" >> $GITHUB_OUTPUT
+
+  update_web_application:
+    environment: production
+    needs: [update_services]
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    env:
+      backendUrl: ${{ needs.update_services.outputs.backendUrl }}
+      databaseUrl: ${{ needs.update_services.outputs.databaseUrl }}
+      syncUrl: ${{ needs.update_services.outputs.syncUrl }}
+    outputs:
+      webAppUrl: ${{ steps.deploy_web_application.outputs.webAppUrl }}
+    steps:
+      # Checks out the repository this file is in
+      - uses: actions/checkout@v3
+
+      # Logs in with your Azure credentials
+      - name: Azure login
+        uses: azure/login@v1.4.6
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create .env.production file
+        run: |
+          echo "REACT_APP_SYNCHRONIZER_URL=${{ env.syncUrl }}" >> ./web/.env.production
+          echo "REACT_APP_AUTH0_DOMAIN=${{ secrets.AUTH0_DOMAIN }}" >> ./web/.env.production
+          echo "REACT_APP_AUTH0_CLIENT_ID=${{ secrets.AUTH0_CLIENT_ID }}" >> ./web/.env.production
+          echo "REACT_APP_BACKEND_URL=${{ env.backendUrl }}" >> ./web/.env.production
+
+      - name: Build and push Web App image to ACR
+        id: build_web_application
+        run: |
+          az acr build \
+            --image ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/${{ env.WEB_CONTAINER_NAME }}:${{ github.sha }} \
+            --registry ${{ env.AZURE_CONTAINER_REGISTRY }} \
+            --file ./web/Dockerfile.prod \
+            -g ${{ env.RESOURCE_GROUP }} ./web
+
+      - name: Deploy Web Application to Azure Container Apps
+        id: deploy_web_application
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
+          az containerapp env create \
+            --name ${{ env.PULL_REQUEST_CONTAINER_APPS_ENV_NAME }} \
+            --resource-group ${{ env.PULL_REQUEST_RESOURCE_GROUP }} \
+            --location ${{ env.LOCATION }}
+          webappfqdn=$(az containerapp create \
+            --name ${{ env.WEB_CONTAINER_NAME }} \
+            --resource-group ${{ env.PULL_REQUEST_RESOURCE_GROUP }} \
+            --environment ${{ env.PULL_REQUEST_CONTAINER_APPS_ENV_NAME }} \
+            --image ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/${{ env.WEB_CONTAINER_NAME }}:${{ github.sha }} \
+            --ingress external \
+            --cpu 0.5 \
+            --memory 1.0Gi \
+            --target-port 80 \
+            --registry-server ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io \
+            --registry-username ${{ secrets.AZURE_CLIENT_ID }} \
+            --registry-password ${{ secrets.AZURE_CLIENT_SECRET }} \
+            --min-replicas 1 \
+            --query properties.configuration.ingress.fqdn \
+            | jq -r '.')
+          echo "webAppUrl=https://${webappfqdn}" >> $GITHUB_OUTPUT
